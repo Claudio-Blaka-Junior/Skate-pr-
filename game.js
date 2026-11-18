@@ -1,8 +1,10 @@
 // =====================================================================
 //  Skate 3D estilo Tony Hawk — Three.js 0.160.0 (importmap no index.html)
+//  Cenário: PSX Les Coleman Skatepark (CC0)
 // =====================================================================
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
@@ -13,7 +15,6 @@ const CFG = {
   alturaPersonagem: 1.8, rotacaoModelo: 0,
   vMax: 20, velInicial: 2.5, tempoDobrar: 0.5,  // andando, a velocidade dobra a cada 0,5 s (até vMax)
   freio: 14, giroRumo: 2.4,
-  gravInclinacao: 14,    // descidas aceleram e subidas freiam (impulso nas descidas dos extremos)
   gravidade: 20, impulsoPulo: 8 * Math.sqrt(1.25), tempoAgachar: 0.2, // pulo 25% mais alto
   gravidadeRampa: 15,    // gravidade mais suave depois de sair de uma rampa (mais tempo no ar)
   vyMinRampa: 8, vyMaxRampa: 13, // impulso vertical ao sair da rampa (garante tempo para 3 manobras)
@@ -26,7 +27,18 @@ const CFG = {
   tempoJogo: 60,         // duração da partida (segundos)
   grindIntervalo: 0.1, grindPontos: 10,
   grindMultiplica: false, // true = multiplica por 10 a cada 0,1 s (cresce MUITO rápido)
-  limite: 88,
+
+  // ----- Cenário (skatepark) -----
+  parque: {
+    arquivo: 'models/skatepark/skatepark.fbx',
+    texturas: 'models/skatepark/textures/',
+    escala: 0.02,                  // o modelo vem em centímetros: 0.01 = tamanho real, 0.02 = 2x maior (rampas boas para o salto do jogo)
+    centro: [1295, 1575],          // centro do parque no modelo (cm), levado para x=0, z=0
+    interior: { xMin: -300, xMax: 2890, zMin: -500, zMax: 3650 }, // parte de dentro das muretas/grades (cm)
+    celula: 0.1,                   // resolução do mapa de alturas (metros)
+  },
+  inicio: { x: -26, z: -16, rumo: Math.PI / 2 },   // largada (rumo PI/2 = andando para +x)
+  corrimao: { ax: -10, az: -16, bx: 24, bz: -16 }, // único corrimão, na faixa livre do meio do parque
 };
 const MANOBRAS = {
   KeyJ: { nome: 'Mortal para trás', pts: 250, eixo: 'x', dur: 0.5 },
@@ -82,90 +94,96 @@ addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight);
 });
 
-// ---------- Terreno aberto: praça de concreto no centro e uma descida em cada extremo ----------
-const suave = (a, b, v) => { const t = THREE.MathUtils.clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
-function terreno(x, z) { // 0 na praça; sobe até 6 m nos extremos (|z| de 72 a 90) e desce de novo depois
-  const a = Math.abs(z);
-  return 6 * suave(46, 72, a) * (1 - suave(90, 110, a)) * (1 - suave(80, 108, Math.abs(x)));
-}
-function texCanvas(w, h, desenhar) {
-  const c = document.createElement('canvas'); c.width = w; c.height = h;
-  desenhar(c.getContext('2d'), w, h);
-  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.wrapS = t.wrapT = THREE.RepeatWrapping; return t;
-}
-const texChao = texCanvas(256, 256, (g, w, h) => {
-  g.fillStyle = '#a4a9b1'; g.fillRect(0, 0, w, h);
-  for (let i = 0; i < 500; i++) { g.fillStyle = Math.random() < 0.5 ? '#b1b6be' : '#979ca4'; g.fillRect(Math.random() * w, Math.random() * h, 3, 3); }
-  g.strokeStyle = '#7d828a'; g.lineWidth = 4; g.strokeRect(0, 0, w, h);
-});
-texChao.repeat.set(55, 55);
-const geoTerreno = new THREE.PlaneGeometry(220, 220, 220, 220).rotateX(-Math.PI / 2);
-{
-  const P = geoTerreno.attributes.position, cores = new Float32Array(P.count * 3), cor = new THREE.Color();
-  for (let i = 0; i < P.count; i++) {
-    const x = P.getX(i), z = P.getZ(i); P.setY(i, terreno(x, z));
-    cor.set(Math.abs(x) < 55 && Math.abs(z) < 76 ? 0xffffff : 0x9be07a); cores.set([cor.r, cor.g, cor.b], i * 3); // concreto no centro, grama fora
-  }
-  geoTerreno.setAttribute('color', new THREE.BufferAttribute(cores, 3)); geoTerreno.computeVertexNormals();
-}
-const terrenoMesh = new THREE.Mesh(geoTerreno, new THREE.MeshStandardMaterial({ map: texChao, vertexColors: true }));
-terrenoMesh.receiveShadow = true; scene.add(terrenoMesh);
-const base = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0x6aa356 }));
-base.position.y = -0.05; scene.add(base); // grama até o horizonte
+// ---------- Cenário: skatepark ----------
+const P = CFG.parque, ESC = P.escala;
+// Limites de dentro do parque (em metros, com uma folga de 0,6 m das muretas)
+const LIM = {
+  x0: (P.interior.xMin - P.centro[0]) * ESC + 0.6, x1: (P.interior.xMax - P.centro[0]) * ESC - 0.6,
+  z0: (P.interior.zMin - P.centro[1]) * ESC + 0.6, z1: (P.interior.zMax - P.centro[1]) * ESC - 0.6,
+};
+// A câmera nunca sai de dentro do alambrado (senão a grade fica na frente da tela)
+const CAMLIM = { x0: (P.interior.xMin - P.centro[0]) * ESC + 0.2, x1: (P.interior.xMax - P.centro[0]) * ESC - 0.2, z0: (P.interior.zMin - P.centro[1]) * ESC + 0.2, z1: (P.interior.zMax - P.centro[1]) * ESC - 0.2 };
+const limitarX = (v) => THREE.MathUtils.clamp(v, LIM.x0, LIM.x1);
+const limitarZ = (v) => THREE.MathUtils.clamp(v, LIM.z0, LIM.z1);
 
-const texJanela = texCanvas(64, 64, (g, w, h) => {
-  g.fillStyle = '#2b2f3a'; g.fillRect(0, 0, w, h);
-  for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) { g.fillStyle = Math.random() < 0.4 ? '#ffd98a' : '#46506a'; g.fillRect(6 + x * 30, 6 + y * 30, 22, 22); }
-});
-let semente = 7; const rnd = () => (semente = (semente * 16807) % 2147483647) / 2147483647;
-function predio(x, z, w, h, d) {
-  const t = texJanela.clone(); t.needsUpdate = true; t.repeat.set(w / 6, h / 6);
-  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshStandardMaterial({ map: t, color: new THREE.Color().setHSL(rnd(), 0.35, 0.65) }));
-  m.position.set(x, h / 2, z); scene.add(m);
-}
-for (let i = 0; i < 12; i++) predio((i % 2 ? 1 : -1) * (64 + rnd() * 28), -44 + rnd() * 88, 12 + rnd() * 5, 8 + rnd() * 10, 12 + rnd() * 5); // lojas nas laterais
-for (let i = 0; i < 18; i++) { const a = rnd() * Math.PI * 2, r = 135 + rnd() * 60; predio(Math.cos(a) * r, Math.sin(a) * r, 14, 20 + rnd() * 30, 14); } // cidade ao longe
-{ // árvores espalhadas fora da praça (InstancedMesh = leve)
-  const n = 70, m4 = new THREE.Matrix4();
-  const troncos = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.2, 0.3, 2, 6), new THREE.MeshStandardMaterial({ color: 0x6b4a2f }), n);
-  const copas = new THREE.InstancedMesh(new THREE.ConeGeometry(1.6, 4.5, 7), new THREE.MeshStandardMaterial({ color: 0x2f7d3a }), n);
-  for (let i = 0; i < n; i++) {
-    let x, z; do { x = (rnd() - 0.5) * 210; z = (rnd() - 0.5) * 210; } while ((Math.abs(x) < 58 && Math.abs(z) < 80) || (Math.abs(x) < 10 && Math.abs(z) > 70));
-    const y = terreno(x, z), e = 0.8 + rnd() * 0.8;
-    troncos.setMatrixAt(i, m4.makeScale(e, e, e).setPosition(x, y + e, z));
-    copas.setMatrixAt(i, m4.makeScale(e, e, e).setPosition(x, y + 4.25 * e, z));
-  }
-  troncos.castShadow = copas.castShadow = true; scene.add(troncos, copas);
-}
+// Piso escuro até o horizonte (evita ver o vazio fora do parque)
+const chaoBase = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0x4b4846 }));
+chaoBase.position.y = -0.05; chaoBase.receiveShadow = true; scene.add(chaoBase);
 
-// ---------- Rampas (cunhas) e corrimãos ----------
-// Cada rampa sobe na direção +z local; "rot" gira a rampa no eixo Y.
-const RAMPAS = [
-  { x: 0, z: 26, w: 6, l: 5, h: 2.2, rot: Math.PI },       // 1ª rampa, de frente para quem desce a grande descida
-  { x: 0, z: -34, w: 6, l: 5, h: 2.2, rot: Math.PI },      // 2ª rampa na mesma linha, depois do corrimão
-  { x: 16, z: -26, w: 6, l: 5, h: 2.2, rot: 0 },           // rampas para a volta (sentido contrário)
-  { x: -16, z: -26, w: 6, l: 5, h: 2.2, rot: 0 },
-  { x: -26, z: 0, w: 5, l: 4.5, h: 1.8, rot: Math.PI / 2 }, // laterais, longe das linhas principais
-  { x: 26, z: 0, w: 5, l: 4.5, h: 1.8, rot: -Math.PI / 2 },
-];
-const matRampa = new THREE.MeshStandardMaterial({ color: 0xb7bcc6, side: THREE.DoubleSide });
-RAMPAS.forEach((r) => {
-  const forma = new THREE.Shape(); forma.moveTo(-r.l / 2, 0); forma.lineTo(r.l / 2, 0); forma.lineTo(r.l / 2, r.h);
-  const geo = new THREE.ExtrudeGeometry(forma, { depth: r.w, bevelEnabled: false });
-  geo.translate(0, 0, -r.w / 2); geo.rotateY(-Math.PI / 2); // comprimento passa para o eixo z local
-  const m = new THREE.Mesh(geo, matRampa); m.position.set(r.x, 0, r.z); m.rotation.y = r.rot;
-  m.castShadow = m.receiveShadow = true; scene.add(m);
-});
-// Altura em (x,z): terreno (descidas nos extremos) + rampas que sobem linearmente
+// Mapa de alturas: cada triângulo do cenário é "desenhado" numa grade (x,z) guardando o ponto mais alto.
+// É por ele que o jogo sabe onde é chão, rampa, degrau ou parede (alturaEm).
+let alt = null;
+function montarAlturas(raiz) {
+  const cs = P.celula, x0 = LIM.x0 - 1.6, z0 = LIM.z0 - 1.6, x1 = LIM.x1 + 1.6, z1 = LIM.z1 + 1.6;
+  const nx = Math.floor((x1 - x0) / cs) + 1, nz = Math.floor((z1 - z0) / cs) + 1;
+  const H = new Float32Array(nx * nz);
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  raiz.updateMatrixWorld(true);
+  raiz.traverse((o) => {
+    if (!o.isMesh) return;
+    const pos = o.geometry.attributes.position, idx = o.geometry.index, n = idx ? idx.count : pos.count;
+    for (let t = 0; t < n; t += 3) {
+      const i0 = idx ? idx.getX(t) : t, i1 = idx ? idx.getX(t + 1) : t + 1, i2 = idx ? idx.getX(t + 2) : t + 2;
+      a.fromBufferAttribute(pos, i0).applyMatrix4(o.matrixWorld);
+      b.fromBufferAttribute(pos, i1).applyMatrix4(o.matrixWorld);
+      c.fromBufferAttribute(pos, i2).applyMatrix4(o.matrixWorld);
+      const det = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+      if (Math.abs(det) < 1e-9) continue;                       // triângulo vertical (parede fina, grade): não tem área vista de cima
+      const ia = Math.max(0, Math.ceil((Math.min(a.x, b.x, c.x) - x0) / cs)), ib = Math.min(nx - 1, Math.floor((Math.max(a.x, b.x, c.x) - x0) / cs));
+      const ja = Math.max(0, Math.ceil((Math.min(a.z, b.z, c.z) - z0) / cs)), jb = Math.min(nz - 1, Math.floor((Math.max(a.z, b.z, c.z) - z0) / cs));
+      for (let j = ja; j <= jb; j++) {
+        const z = z0 + j * cs;
+        for (let i = ia; i <= ib; i++) {
+          const x = x0 + i * cs;
+          const l1 = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / det, l2 = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / det, l3 = 1 - l1 - l2;
+          if (l1 < -1e-6 || l2 < -1e-6 || l3 < -1e-6) continue;
+          const h = l1 * a.y + l2 * b.y + l3 * c.y;
+          if (h > H[j * nx + i]) H[j * nx + i] = h;
+        }
+      }
+    }
+  });
+  return { H, nx, nz, x0, z0, cs };
+}
+// Altura do chão em (x,z): rampas e bancos suaves; degraus e muretas viram "degrau" seco (sem interpolar)
 function alturaEm(x, z) {
-  let h = terreno(x, z);
-  for (const r of RAMPAS) {
-    const dx = x - r.x, dz = z - r.z, c = Math.cos(r.rot), s = Math.sin(r.rot);
-    const lx = dx * c - dz * s, lz = dx * s + dz * c;
-    if (Math.abs(lx) <= r.w / 2 && Math.abs(lz) <= r.l / 2) h = Math.max(h, r.h * (lz + r.l / 2) / r.l);
-  }
-  return h;
+  if (!alt) return 0;
+  const { H, nx, nz, x0, z0, cs } = alt;
+  const fx = THREE.MathUtils.clamp((x - x0) / cs, 0, nx - 1.001), fz = THREE.MathUtils.clamp((z - z0) / cs, 0, nz - 1.001);
+  const i = Math.floor(fx), j = Math.floor(fz), tx = fx - i, tz = fz - j, k = j * nx + i;
+  const h00 = H[k], h10 = H[k + 1], h01 = H[k + nx], h11 = H[k + nx + 1];
+  if (Math.max(h00, h10, h01, h11) - Math.min(h00, h10, h01, h11) > 0.35) return tz < 0.5 ? (tx < 0.5 ? h00 : h10) : (tx < 0.5 ? h01 : h11);
+  return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
 }
+async function carregarParque() {
+  try {
+    const loader = new FBXLoader(); loader.setResourcePath(P.texturas);
+    const raiz = await loader.loadAsync(P.arquivo);
+    raiz.scale.setScalar(ESC); raiz.position.set(-P.centro[0] * ESC, 0, -P.centro[1] * ESC); raiz.updateMatrixWorld(true);
+    raiz.traverse((o) => {
+      if (!o.isMesh) return;
+      const grade = [].concat(o.material).some((m) => /fence/i.test(m.name));
+      if (grade) { // alambrado: tela fina e translúcida, sem sombra (a textura é uma malha de arame bem fina)
+        const m = o.material;
+        o.material = new THREE.MeshBasicMaterial({ map: m.map, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+        o.castShadow = o.receiveShadow = false; return;
+      }
+      o.castShadow = o.receiveShadow = true;
+      for (const m of [].concat(o.material)) {
+        if (m.specular) m.specular.set(0x000000);                // sem brilho plástico
+        if (m.map) { m.map.magFilter = THREE.NearestFilter; m.map.anisotropy = 4; } // pixels nítidos, visual PSX
+      }
+    });
+    scene.add(raiz);
+    alt = montarAlturas(raiz);
+  } catch (e) {
+    console.warn(`[cenário] falha ao carregar "${P.arquivo}": usando piso plano.`, e);
+    chaoBase.position.y = 0;
+    const av = document.getElementById('aviso'); if (av) av.textContent += `Falha ao carregar o cenário (usando piso plano): ${e.message || e}`.slice(0, 200);
+  }
+}
+
+// ---------- Corrimão (único) ----------
 const CORRIMAOS = [];
 const matMetal = new THREE.MeshStandardMaterial({ color: 0xd9dde3, metalness: 0.7, roughness: 0.3 });
 function criarCorrimao(ax, az, bx, bz) {
@@ -177,7 +195,7 @@ function criarCorrimao(ax, az, bx, bz) {
     const p = new THREE.Mesh(new THREE.BoxGeometry(0.08, r.y, 0.08), matMetal); p.position.set(ax + r.dx * t, r.y / 2, az + r.dz * t); scene.add(p);
   }
 }
-criarCorrimao(0, 14, 0, -28); // único corrimão: logo depois da 1ª rampa, para cair nele ao sair dela
+criarCorrimao(CFG.corrimao.ax, CFG.corrimao.az, CFG.corrimao.bx, CFG.corrimao.bz);
 
 // ---------- Jogador: corpo > (skate + personagem) ----------
 const jogador = new THREE.Group(), corpo = new THREE.Group(), visual = new THREE.Group(), skate = new THREE.Group(), salto = new THREE.Group();
@@ -237,7 +255,7 @@ function usarCubo() {
 })();
 
 // ---------- Entrada e HUD ----------
-const tecla = new Set(); let jogando = false, pedPulo = false, pedManobra = null;
+const tecla = new Set(); let jogando = false, pedPulo = false, pedManobra = null, parqueOk = false;
 addEventListener('keydown', (e) => {
   if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
   if (!e.repeat) { if (e.code === 'Space') pedPulo = true; if (MANOBRAS[e.code]) pedManobra = e.code; }
@@ -247,8 +265,10 @@ addEventListener('keyup', (e) => tecla.delete(e.code));
 addEventListener('blur', () => tecla.clear());
 const k = (...c) => c.some((x) => tecla.has(x));
 const telaInicio = document.getElementById('inicio');
-const comecar = () => { if (jogando) return; jogando = true; telaInicio.style.display = 'none'; somPulo.liberar(); somAterrissar.liberar(); somMusica.tocar(); };
-document.getElementById('comecar').addEventListener('click', comecar);
+const btnComecar = document.getElementById('comecar');
+btnComecar.disabled = true; btnComecar.textContent = 'Carregando cenário…'; // libera quando o parque termina de carregar
+const comecar = () => { if (jogando || !parqueOk) return; jogando = true; telaInicio.style.display = 'none'; somPulo.liberar(); somAterrissar.liberar(); somMusica.tocar(); };
+btnComecar.addEventListener('click', comecar);
 addEventListener('keydown', (e) => { if (e.code === 'Enter') comecar(); });
 
 const elTotal = document.getElementById('total'), elCombo = document.getElementById('comboTxt'), elMsg = document.getElementById('msg'), elTempo = document.getElementById('tempo'), elFim = document.getElementById('fim'), elSeq = document.getElementById('seq'), elPainel = document.getElementById('painel'), elTermo = document.getElementById('termo'), elTermoFill = document.getElementById('termoFill');
@@ -257,7 +277,7 @@ function msg(t, ms = 1300) { elMsg.textContent = t; clearTimeout(msgT); msgT = s
 
 // ---------- Estado do jogo ----------
 let estado = 'chao';           // chao | agachando | ar | grind | queda
-let tEst = 0, tAterr = 0, rumo = Math.PI, vel = 0, vy = 0, vyChao = 0;
+let tEst = 0, tAterr = 0, rumo = CFG.inicio.rumo, vel = 0, vy = 0, vyChao = 0;
 const vh = new THREE.Vector2(); // velocidade horizontal no ar (x, z)
 let trick = null, fila = [], manobrasNoAr = 0, gravAtual = CFG.gravidade, voltas = 0, giroAcum = 0, comboT = 0, gT = 0, gCD = 0;
 let rail = null, railT = 0, railSinal = 1, railVel = 0, railYaw = 0, railLado = false;
@@ -265,7 +285,6 @@ let total = 0, pontosCombo = 0, mult = 1, tempo = CFG.tempoJogo, fim = false;
 let tMult = 0, nCombos = 0, ultTotal = '', ultCombo = '', ultSeq = '';
 const PAPEL = { chao: 'parado', agachando: 'agachar', ar: 'pulo', grind: 'parado', queda: 'aterrissar' };
 function setEstado(e) { estado = e; if (mixer) tocarAnim(PAPEL[e]); }
-const limitar = (v) => THREE.MathUtils.clamp(v, -CFG.limite, CFG.limite);
 const difAng = (a, b) => ((b - a + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
 const girarAte = (a, alvo, f) => a + difAng(a, alvo) * Math.min(1, f);
 function distCorrimao(r, x, z) { // distância de um ponto ao corrimão (usada para não atravessá-lo)
@@ -387,9 +406,9 @@ function encerrar() { // fim dos 60 s: soma o combo pendente e mostra a pontuaç
 }
 function reiniciar() {
   total = 0; pontosCombo = 0; mult = 1; nCombos = 0; tMult = 0; comboT = 0; tempo = CFG.tempoJogo; fim = false; trick = null; fila = []; rail = null; limparSequencia(); marcoIdx = 0; filaMarcos = []; marcoOcupado = false; elMarco.className = '';
-  vel = 0; vy = 0; vyChao = 0; vh.set(0, 0); rumo = Math.PI; tAterr = 0;
-  jogador.rotation.y = Math.PI; corpo.rotation.x = 0; salto.rotation.x = 0; visual.rotation.x = 0; visual.position.y = 0.16; skate.rotation.set(0, 0, 0);
-  pos.set(0, terreno(0, 80), 80); // começa no alto da descida
+  vel = 0; vy = 0; vyChao = 0; vh.set(0, 0); rumo = CFG.inicio.rumo; tAterr = 0;
+  jogador.rotation.y = rumo; corpo.rotation.x = 0; salto.rotation.x = 0; visual.rotation.x = 0; visual.position.y = 0.16; skate.rotation.set(0, 0, 0);
+  pos.set(CFG.inicio.x, alturaEm(CFG.inicio.x, CFG.inicio.z), CFG.inicio.z); // largada no parque
   setEstado('chao'); elFim.style.display = 'none';
 }
 elFim.addEventListener('click', reiniciar);
@@ -409,9 +428,8 @@ function atualizar(dt) {
     if (W) { vel = vel < CFG.vMax ? Math.min(CFG.vMax, Math.max(vel, CFG.velInicial) * Math.pow(2, dt / CFG.tempoDobrar)) : vel * Math.exp(-0.5 * dt); } // dobra a cada 0,5 s
     else { vel *= Math.exp(-0.8 * dt); if (Math.abs(vel) < 0.3) vel = 0; }                                                       // parou: zera
     if (S) vel = Math.max(-3, vel - CFG.freio * dt);
-    const inclina = (terreno(pos.x + fx * 0.6, pos.z + fz * 0.6) - terreno(pos.x - fx * 0.6, pos.z - fz * 0.6)) / 1.2; // >0 = subida
-    vel = THREE.MathUtils.clamp(vel - inclina * CFG.gravInclinacao * dt, -3, 28);   // descida acelera, subida freia
-    const rx = pos.x + fx * vel * dt, rz = pos.z + fz * vel * dt, nx = limitar(rx), nz = limitar(rz), g = alturaEm(nx, nz);
+    vel = THREE.MathUtils.clamp(vel, -3, 28);
+    const rx = pos.x + fx * vel * dt, rz = pos.z + fz * vel * dt, nx = limitarX(rx), nz = limitarZ(rz), g = alturaEm(nx, nz);
     const bateu = nx !== rx || nz !== rz || CORRIMAOS.some((r) => pos.y < r.y - 0.2 && distCorrimao(r, nx, nz) < 0.4);
     if (g - pos.y > 0.5 || bateu) vel = 0;                            // bateu (rampa, corrimão ou borda): velocidade zera
     else if (pos.y - g > 0.5) {                                       // saiu do topo da rampa: decola
@@ -421,7 +439,7 @@ function atualizar(dt) {
     if (estado === 'agachando' && (tEst -= dt) <= 0) {                // impulso do pulo
       vy = CFG.impulsoPulo + Math.min(8, Math.max(0, vyChao)); vh.set(fx * vel, fz * vel); entrarNoAr(CFG.gravidade); somPulo.tocar(); setEstado('ar');
     }
-    const p = Math.atan2(alturaEm(pos.x + fx * 0.6, pos.z + fz * 0.6) - alturaEm(pos.x - fx * 0.6, pos.z - fz * 0.6), 1.2);
+    const p = THREE.MathUtils.clamp(Math.atan2(alturaEm(pos.x + fx * 0.6, pos.z + fz * 0.6) - alturaEm(pos.x - fx * 0.6, pos.z - fz * 0.6), 1.2), -0.9, 0.9);
     corpo.rotation.x += (-p - corpo.rotation.x) * Math.min(1, 12 * dt);  // inclina junto com a rampa
     jogador.rotation.y = girarAte(jogador.rotation.y, rumo, 12 * dt);
     if (estado === 'chao' && pontosCombo > 0 && (comboT -= dt) <= 0) {  // fecha o combo: soma e dobra o multiplicador
@@ -434,7 +452,7 @@ function atualizar(dt) {
       const d = dirX * CFG.giroAr * dt; jogador.rotation.y += d; giroAcum += Math.abs(d);
       while (giroAcum >= Math.PI) { giroAcum -= Math.PI; voltas++; pontosCombo += 50 * voltas; atividade(); msg(`Giro ${voltas * 180}°  +${50 * voltas}`, 800); }
     }
-    let nx = limitar(pos.x + vh.x * dt), nz = limitar(pos.z + vh.y * dt);
+    let nx = limitarX(pos.x + vh.x * dt), nz = limitarZ(pos.z + vh.y * dt);
     if (CORRIMAOS.some((r) => pos.y < r.y - 0.2 && distCorrimao(r, nx, nz) < 0.4)) { nx = pos.x; nz = pos.z; vh.set(0, 0); } // não atravessa o corrimão
     pos.x = nx; pos.z = nz; pos.y += vy * dt;
     corpo.rotation.x += (0 - corpo.rotation.x) * Math.min(1, 8 * dt);
@@ -503,8 +521,8 @@ function atualizar(dt) {
 }
 
 // ---------- Câmera e loop ----------
-reiniciar(); camera.position.set(pos.x, pos.y + 4.5, pos.z + 9);
-let camYaw = Math.PI; const alvoCam = new THREE.Vector3(), relogio = new THREE.Clock();
+reiniciar(); camera.position.set(THREE.MathUtils.clamp(pos.x - Math.sin(rumo) * 9, CAMLIM.x0, CAMLIM.x1), pos.y + 4.5, THREE.MathUtils.clamp(pos.z - Math.cos(rumo) * 9, CAMLIM.z0, CAMLIM.z1));
+let camYaw = rumo; const alvoCam = new THREE.Vector3(), relogio = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(relogio.getDelta(), 0.05);
   atualizar(dt); if (mixer) mixer.update(dt);
@@ -512,7 +530,14 @@ renderer.setAnimationLoop(() => {
   camera.fov = 65 + Math.min(Math.max(vel, 0), 28) * 0.5; camera.updateProjectionMatrix(); // sensação de velocidade
   if (jogando) alvoCam.set(pos.x - Math.sin(camYaw) * 9, pos.y * 0.5 + 4.5, pos.z - Math.cos(camYaw) * 9);
   else { const a = performance.now() / 8000; alvoCam.set(pos.x + Math.sin(a) * 18, pos.y + 5, pos.z + Math.cos(a) * 18); } // câmera orbita enquanto a tela inicial está aberta
+  alvoCam.x = THREE.MathUtils.clamp(alvoCam.x, CAMLIM.x0, CAMLIM.x1); alvoCam.z = THREE.MathUtils.clamp(alvoCam.z, CAMLIM.z0, CAMLIM.z1);
   camera.position.lerp(alvoCam, 1 - Math.exp(-8 * dt)); camera.lookAt(pos.x, pos.y + 1.2, pos.z);
   sol.position.set(pos.x + 12, 25, pos.z + 10); sol.target.position.copy(pos);
   renderer.render(scene, camera);
+});
+
+// Carrega o parque; quando terminar, coloca o jogador na largada (já com o mapa de alturas) e libera o botão
+carregarParque().then(() => {
+  parqueOk = true; btnComecar.disabled = false; btnComecar.textContent = 'Clique para começar';
+  reiniciar(); camYaw = rumo; camera.position.set(THREE.MathUtils.clamp(pos.x - Math.sin(rumo) * 9, CAMLIM.x0, CAMLIM.x1), pos.y + 4.5, THREE.MathUtils.clamp(pos.z - Math.cos(rumo) * 9, CAMLIM.z0, CAMLIM.z1));
 });
